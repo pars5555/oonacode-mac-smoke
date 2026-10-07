@@ -1,0 +1,81 @@
+name: Run the staged macOS payload
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag holding the staged files
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, label: 'Apple Silicon macOS 14', arch: arm64 }
+          - { runner: macos-15, label: 'Apple Silicon macOS 15', arch: arm64 }
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: This machine
+        run: |
+          sw_vers; uname -m; sysctl -n machdep.cpu.brand_string
+          echo "translated: $(sysctl -n sysctl.proc_translated 2>/dev/null || echo n/a)"
+      - name: Download the staged files and check them
+        run: |
+          mkdir stage && cd stage
+          gh release download "${{ inputs.tag }}" -R "$GITHUB_REPOSITORY"
+          ls -l
+          shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+          file *.tar.gz || true
+      - name: Install the arm64 payload (the real install.sh, --archive)
+        run: |
+          v="$(ls stage/OonaCode-*-mac-arm64.zip | sed -E 's/.*OonaCode-(.*)-mac-arm64.zip/\1/')"
+          echo "version $v"
+          bash install.sh --archive stage/oonacode-darwin-arm64.tar.gz --app-zip "stage/OonaCode-$v-mac-arm64.zip" --allow-unsigned
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: oona and its engine run natively
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          which oona; file "$(which oona)" || true
+          file "$(readlink "$(which oona)" 2>/dev/null || which oona)" || true
+          oona --version
+          oona doctor || true
+          engine="$(find "$HOME/Library/Application Support/OonaCode/engine" -name oonaclaude -type f | head -1)"
+          [ -n "$engine" ] || { echo "no engine"; exit 1; }
+          file "$engine"
+          file "$engine" | grep -q arm64
+          "$engine" --version
+      - name: The service and the app
+        continue-on-error: true
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          oona service status || true
+          app="$HOME/Applications/OonaCode.app"
+          test -d "$app"
+          file "$app/Contents/MacOS/OonaCode" | grep -q arm64
+          codesign --verify --deep --strict "$app" && echo "app signature valid"
+          open "$app"
+          for _ in $(seq 1 30); do
+            pgrep -f "$app/Contents/MacOS/OonaCode" >/dev/null && { echo "OonaCode is running"; exit 0; }
+            sleep 2
+          done
+          echo "OonaCode did not start"; exit 1
+      - name: Logs
+        if: always()
+        run: |
+          for f in "$HOME/Library/Application Support/OonaCode/logs/"*.log; do
+            [ -f "$f" ] && { echo "::group::$f"; tail -40 "$f"; echo "::endgroup::"; }
+          done
+          true
